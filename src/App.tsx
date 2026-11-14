@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Html5Qrcode } from "html5-qrcode";
 import { Camera } from "@capacitor/camera";
+import { Filesystem, Directory } from "@capacitor/filesystem";
+import { Share } from "@capacitor/share";
 import { Capacitor } from "@capacitor/core";
 import QRCode from "qrcode";
 import { jsPDF } from "jspdf";
@@ -17,6 +19,7 @@ const TICKETS_KEY = "culture-day-ticket-codes-v1";
 async function downloadTicketsPdf(event: TicketEvent, tickets: Ticket[], onlyIndex?: number) {
   const selected = onlyIndex === undefined ? tickets : [tickets[onlyIndex]].filter(Boolean);
   if (!selected.length) throw new Error("Ticket code is not saved on this device.");
+
   const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
   const cols = onlyIndex === undefined ? 3 : 1;
   const rowsPerPage = onlyIndex === undefined ? 4 : 1;
@@ -26,11 +29,13 @@ async function downloadTicketsPdf(event: TicketEvent, tickets: Ticket[], onlyInd
   const cardH = onlyIndex === undefined ? 63 : 112;
   const startX = onlyIndex === undefined ? 10 : 60;
   const startY = onlyIndex === undefined ? 10 : 92;
+
   for (let i = 0; i < selected.length; i++) {
     if (i > 0 && i % (cols * rowsPerPage) === 0) pdf.addPage();
     const pos = i % (cols * rowsPerPage);
     const x = onlyIndex === undefined ? startX + (pos % cols) * cellW : startX;
     const y = onlyIndex === undefined ? startY + Math.floor(pos / cols) * cellH : startY;
+
     pdf.setDrawColor(25, 25, 25);
     pdf.roundedRect(x, y, cardW, cardH, 2, 2);
     pdf.setFont("helvetica", "bold");
@@ -38,16 +43,37 @@ async function downloadTicketsPdf(event: TicketEvent, tickets: Ticket[], onlyInd
     pdf.text("CULTURE DAY", x + cardW / 2, y + (onlyIndex === undefined ? 8 : 15), { align: "center" });
     pdf.setFont("helvetica", "normal");
     pdf.setFontSize(onlyIndex === undefined ? 8 : 11);
-    pdf.text(`${event.kind} TICKET  #${String(selected[i].number).padStart(3, "0")}`, x + cardW / 2, y + (onlyIndex === undefined ? 14 : 23), { align: "center" });
+    pdf.text(`${event.kind} TICKET #${String(selected[i].number).padStart(3, "0")}`, x + cardW / 2, y + (onlyIndex === undefined ? 14 : 23), { align: "center" });
+
     const qrSize = onlyIndex === undefined ? 40 : 66;
     const qr = await QRCode.toDataURL(selected[i].token, { errorCorrectionLevel: "H", margin: 1, width: 500 });
     pdf.addImage(qr, "PNG", x + (cardW - qrSize) / 2, y + (onlyIndex === undefined ? 17 : 31), qrSize, qrSize);
     pdf.setFontSize(onlyIndex === undefined ? 6 : 9);
     pdf.text("ONE ENTRY", x + cardW / 2, y + (onlyIndex === undefined ? 60 : 105), { align: "center" });
   }
-  pdf.save(onlyIndex === undefined
+
+  const filename = onlyIndex === undefined
     ? `culture-day-${event.kind.toLowerCase()}-tickets.pdf`
-    : `culture-day-${event.kind.toLowerCase()}-ticket-${String(selected[0].number).padStart(3, "0")}.pdf`);
+    : `culture-day-${event.kind.toLowerCase()}-ticket-${String(selected[0].number).padStart(3, "0")}.pdf`;
+
+  if (Capacitor.isNativePlatform()) {
+    const dataUri = pdf.output("datauristring");
+    const base64 = dataUri.slice(dataUri.indexOf(",") + 1);
+    const saved = await Filesystem.writeFile({
+      path: filename,
+      data: base64,
+      directory: Directory.Cache,
+      recursive: true
+    });
+    await Share.share({
+      title: filename,
+      text: "Culture Day ticket PDF",
+      files: [saved.uri],
+      dialogTitle: "Save or share ticket PDF"
+    });
+  } else {
+    pdf.save(filename);
+  }
 }
 
 function explainError(message: string) {
@@ -75,9 +101,11 @@ export default function App() {
   const [scanBusy, setScanBusy] = useState(false);
   const [manualToken, setManualToken] = useState("");
   const [cameraOn, setCameraOn] = useState(false);
+  const [scanPaused, setScanPaused] = useState(false);
   const [eventBusy, setEventBusy] = useState(false);
   const scannerRef = useRef<Html5Qrcode | null>(null);
   const handledRef = useRef(false);
+  const scanInFlightRef = useRef(false);
 
   useEffect(() => {
     if (!supabase) return;
@@ -160,6 +188,8 @@ export default function App() {
   async function verifyToken(raw: string) {
     const token = raw.trim();
     if (!token || !currentEvent || !supabase || !session?.access_token || scanBusy) return;
+    if (scanInFlightRef.current) return;
+    scanInFlightRef.current = true;
     setScanBusy(true); setScanResult(null); setScanMessage("");
     try {
       const response = await fetch(`${FUNCTIONS_URL}/verify-ticket`, {
@@ -178,12 +208,30 @@ export default function App() {
     } catch {
       setScanResult("SERVICE_UNAVAILABLE");
       setScanMessage("Could not reach the verification service. Do not admit.");
-    } finally { setScanBusy(false); }
+    } finally {
+      scanInFlightRef.current = false;
+      setScanBusy(false);
+    }
+  }
+
+  async function scanNext() {
+    const scanner = scannerRef.current;
+    if (!scanner || !scanner.isScanning || scanInFlightRef.current) return;
+    handledRef.current = false;
+    setScanPaused(false);
+    setScanResult(null);
+    setScanMessage("");
+    try {
+      scanner.resume();
+    } catch {
+      setScanMessage("Scanner could not resume. Stop and start the camera again.");
+    }
   }
 
   async function startCamera() {
     if (!currentEvent) return;
-    setScanResult(null); setScanMessage("");
+    setScanResult(null); setScanMessage(""); setScanPaused(false);
+    handledRef.current = false;
     try {
       if (Capacitor.isNativePlatform()) {
         let permission = await Camera.checkPermissions();
@@ -199,12 +247,11 @@ export default function App() {
         { facingMode: "environment" },
         { fps: 10, qrbox: { width: 250, height: 250 }, aspectRatio: 1 },
         async decoded => {
-          if (handledRef.current || scanBusy) return;
+          if (handledRef.current || scanInFlightRef.current) return;
           handledRef.current = true;
-          await scanner.pause(true);
+          setScanPaused(true);
+          await scanner.pause(false);
           await verifyToken(decoded);
-          window.setTimeout(() => { handledRef.current = false; }, 1400);
-          window.setTimeout(() => { if (scannerRef.current?.isScanning) scanner.resume(); }, 1500);
         },
         () => undefined
       );
@@ -275,7 +322,7 @@ export default function App() {
         <h1>Scanner</h1>
         <label className="event-select">Event<select value={selectedEvent} onChange={e => { setSelectedEvent(e.target.value); setScanResult(null); setScanMessage(""); }}><option value="">Select event</option>{events.map(e => <option key={e.id} value={e.id}>{e.name} — {e.kind}</option>)}</select></label>
         <div className="scanner-layout">
-          <div className="camera-panel"><div id="qr-reader" />{!cameraOn ? <button className="primary full" disabled={!currentEvent} onClick={startCamera}>Start camera</button> : <button className="secondary full" onClick={stopCamera}>Stop camera</button>}</div>
+          <div className="camera-panel"><div id="qr-reader" />{!cameraOn ? <button className="primary full" disabled={!currentEvent} onClick={startCamera}>Start camera</button> : <div className="camera-actions">{scanPaused ? <button className="primary" disabled={scanBusy} onClick={scanNext}>Scan next</button> : null}<button className="secondary" onClick={stopCamera}>Stop camera</button></div>}</div>
           <div className="result-panel">
             <div className={`result-display ${scanResult === "VERIFIED" ? "good" : scanResult === "INVALID" ? "bad" : scanResult === "SERVICE_UNAVAILABLE" ? "offline" : ""}`}>
               {scanBusy ? <div className="loading-dot" /> : scanResult === "VERIFIED" ? <><div className="checkmark">✓</div><div className="result-word">VERIFIED</div></> : scanResult === "INVALID" ? <><div className="cross">×</div><div className="result-word">INVALID</div></> : scanResult === "SERVICE_UNAVAILABLE" ? <><div className="cross">!</div><div className="result-word">OFFLINE</div></> : <><div className="scan-icon">⌗</div><div className="result-word idle">READY</div></>}
