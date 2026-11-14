@@ -16,6 +16,76 @@ type Result = "VERIFIED" | "INVALID" | "SERVICE_UNAVAILABLE" | null;
 const STORE_KEY = "culture-day-events-v1";
 const TICKETS_KEY = "culture-day-ticket-codes-v1";
 
+type TicketBackup = {
+  format: "culture-day-ticket-backup";
+  version: 1;
+  createdAt: string;
+  events: TicketEvent[];
+  ticketSets: Record<string, Ticket[]>;
+};
+
+async function saveTicketBackup(events: TicketEvent[], ticketSets: Record<string, Ticket[]>) {
+  const backup: TicketBackup = {
+    format: "culture-day-ticket-backup",
+    version: 1,
+    createdAt: new Date().toISOString(),
+    events,
+    ticketSets
+  };
+  const json = JSON.stringify(backup, null, 2);
+  const filename = `culture-day-qr-backup-${new Date().toISOString().slice(0, 10)}.json`;
+
+  if (Capacitor.isNativePlatform()) {
+    const saved = await Filesystem.writeFile({
+      path: filename,
+      data: btoa(unescape(encodeURIComponent(json))),
+      directory: Directory.Cache,
+      recursive: true
+    });
+    await Share.share({
+      title: "Culture Day QR backup",
+      text: "Keep this file private. It contains ticket QR codes and verification tokens.",
+      files: [saved.uri],
+      dialogTitle: "Save QR ticket backup"
+    });
+  } else {
+    const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+}
+
+function parseTicketBackup(value: unknown): TicketBackup {
+  if (!value || typeof value !== "object") throw new Error("Invalid backup file.");
+  const backup = value as TicketBackup;
+
+  if (backup.format !== "culture-day-ticket-backup" || backup.version !== 1 ||
+      !Array.isArray(backup.events) || !backup.ticketSets ||
+      typeof backup.ticketSets !== "object") {
+    throw new Error("Unsupported or damaged backup.");
+  }
+
+  const validEvents = backup.events.every(event =>
+    event && typeof event.id === "string" && typeof event.name === "string" &&
+    typeof event.count === "number" && (event.kind === "REAL" || event.kind === "TEST")
+  );
+
+  const validSets = Object.entries(backup.ticketSets).every(([id, tickets]) =>
+    typeof id === "string" && Array.isArray(tickets) &&
+    tickets.every(ticket => ticket && Number.isInteger(ticket.number) &&
+      ticket.number > 0 && typeof ticket.token === "string" && ticket.token.length > 0)
+  );
+
+  if (!validEvents || !validSets ||
+      backup.events.some(event => !Array.isArray(backup.ticketSets[event.id]))) {
+    throw new Error("Backup validation failed. Nothing was restored.");
+  }
+  return backup;
+}
+
 async function downloadTicketsPdf(event: TicketEvent, tickets: Ticket[], onlyIndex?: number) {
   const selected = onlyIndex === undefined ? tickets : [tickets[onlyIndex]].filter(Boolean);
   if (!selected.length) throw new Error("Ticket code is not saved on this device.");
@@ -130,6 +200,42 @@ export default function App() {
 
   const currentEvent = useMemo(() => events.find(e => e.id === selectedEvent), [events, selectedEvent]);
   const currentTickets = currentEvent ? (ticketSets[currentEvent.id] || []) : [];
+
+  async function backupQrTickets() {
+    try {
+      if (!events.length || !Object.values(ticketSets).some(tickets => tickets.length)) {
+        throw new Error("No saved QR tickets found on this device.");
+      }
+      await saveTicketBackup(events, ticketSets);
+      setNotice("QR backup prepared. Save the file somewhere safe.");
+    } catch (e: any) {
+      setNotice(e.message || "Could not create QR backup.");
+    }
+  }
+
+  async function restoreQrTickets(file?: File) {
+    if (!file) return;
+    try {
+      const backup = parseTicketBackup(JSON.parse(await file.text()));
+      const mergedEvents = [
+        ...backup.events,
+        ...events.filter(event => !backup.events.some(saved => saved.id === event.id))
+      ];
+      const mergedSets = { ...ticketSets, ...backup.ticketSets };
+
+      localStorage.setItem(STORE_KEY, JSON.stringify(mergedEvents));
+      localStorage.setItem(TICKETS_KEY, JSON.stringify(mergedSets));
+      setEvents(mergedEvents);
+      setTicketSets(mergedSets);
+      if (backup.events.length) setSelectedEvent(backup.events[0].id);
+
+      const total = Object.values(backup.ticketSets)
+        .reduce((sum, tickets) => sum + tickets.length, 0);
+      setNotice(`Restored ${total} QR tickets. Other batches were preserved.`);
+    } catch (e: any) {
+      setNotice(e.message || "Could not restore QR backup.");
+    }
+  }
 
   async function authenticate() {
     if (!supabase) return;
@@ -279,6 +385,19 @@ export default function App() {
         <label>Email<input type="email" autoComplete="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="Email address" /></label>
         <label>Password<div className="password-wrap"><input type={showPassword ? "text" : "password"} autoComplete={authMode === "signin" ? "current-password" : "new-password"} value={password} onChange={e => setPassword(e.target.value)} placeholder="Password" /><button type="button" className="show-password" onClick={() => setShowPassword(v => !v)}>{showPassword ? "Hide" : "Show"}</button></div></label>
         <button className="primary full" disabled={authBusy || !email || password.length < 8} onClick={authenticate}>{authBusy ? "Please wait…" : authMode === "signin" ? "Sign in" : "Create account"}</button>
+        <div className="batch-actions" style={{ margin: "16px 0", flexWrap: "wrap" }}>
+          <button className="secondary" disabled={!events.length} onClick={backupQrTickets}>
+            Backup QR tickets
+          </button>
+          <label className="secondary" style={{ display: "inline-flex", alignItems: "center", cursor: "pointer", padding: "10px 14px", borderRadius: "8px" }}>
+            Restore QR backup
+            <input type="file" accept="application/json,.json" style={{ display: "none" }}
+              onChange={e => {
+                void restoreQrTickets(e.target.files?.[0]);
+                e.currentTarget.value = "";
+              }} />
+          </label>
+        </div>
         {notice && <p className="notice">{notice}</p>}
       </section>
     </main>
