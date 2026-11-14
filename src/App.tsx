@@ -1,37 +1,53 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Html5Qrcode } from "html5-qrcode";
+import { Camera } from "@capacitor/camera";
+import { Capacitor } from "@capacitor/core";
 import QRCode from "qrcode";
 import { jsPDF } from "jspdf";
 import { FUNCTIONS_URL, configured, supabase } from "./supabase";
 
+type Ticket = { number: number; token: string };
 type TicketEvent = { id: string; name: string; count: number; kind: "REAL" | "TEST" };
 type AuthMode = "signin" | "signup";
 type Result = "VERIFIED" | "INVALID" | "SERVICE_UNAVAILABLE" | null;
 
 const STORE_KEY = "culture-day-events-v1";
+const TICKETS_KEY = "culture-day-ticket-codes-v1";
 
-async function downloadTicketsPdf(event: TicketEvent, tickets: {number:number;token:string}[]) {
+async function downloadTicketsPdf(event: TicketEvent, tickets: Ticket[], onlyIndex?: number) {
+  const selected = onlyIndex === undefined ? tickets : [tickets[onlyIndex]].filter(Boolean);
+  if (!selected.length) throw new Error("Ticket code is not saved on this device.");
   const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
-  const cols = 3, rows = 4, cellW = 63, cellH = 68, startX = 10, startY = 10;
-  for (let i = 0; i < tickets.length; i++) {
-    if (i > 0 && i % (cols * rows) === 0) pdf.addPage();
-    const pos = i % (cols * rows);
-    const x = startX + (pos % cols) * cellW;
-    const y = startY + Math.floor(pos / cols) * cellH;
-    pdf.setDrawColor(45, 48, 56);
-    pdf.roundedRect(x, y, 58, 63, 3, 3);
+  const cols = onlyIndex === undefined ? 3 : 1;
+  const rowsPerPage = onlyIndex === undefined ? 4 : 1;
+  const cellW = onlyIndex === undefined ? 63 : 190;
+  const cellH = onlyIndex === undefined ? 68 : 277;
+  const cardW = onlyIndex === undefined ? 58 : 90;
+  const cardH = onlyIndex === undefined ? 63 : 112;
+  const startX = onlyIndex === undefined ? 10 : 60;
+  const startY = onlyIndex === undefined ? 10 : 92;
+  for (let i = 0; i < selected.length; i++) {
+    if (i > 0 && i % (cols * rowsPerPage) === 0) pdf.addPage();
+    const pos = i % (cols * rowsPerPage);
+    const x = onlyIndex === undefined ? startX + (pos % cols) * cellW : startX;
+    const y = onlyIndex === undefined ? startY + Math.floor(pos / cols) * cellH : startY;
+    pdf.setDrawColor(25, 25, 25);
+    pdf.roundedRect(x, y, cardW, cardH, 2, 2);
     pdf.setFont("helvetica", "bold");
-    pdf.setFontSize(10);
-    pdf.text("CULTURE DAY", x + 29, y + 8, { align: "center" });
+    pdf.setFontSize(onlyIndex === undefined ? 10 : 17);
+    pdf.text("CULTURE DAY", x + cardW / 2, y + (onlyIndex === undefined ? 8 : 15), { align: "center" });
     pdf.setFont("helvetica", "normal");
-    pdf.setFontSize(8);
-    pdf.text(`${event.kind} TICKET  •  #${String(tickets[i].number).padStart(3,"0")}`, x + 29, y + 14, { align: "center" });
-    const qr = await QRCode.toDataURL(tickets[i].token, { errorCorrectionLevel: "H", margin: 1, width: 420 });
-    pdf.addImage(qr, "PNG", x + 9, y + 17, 40, 40);
-    pdf.setFontSize(6);
-    pdf.text("One entry • One scan • Keep this QR private", x + 29, y + 60, { align: "center" });
+    pdf.setFontSize(onlyIndex === undefined ? 8 : 11);
+    pdf.text(`${event.kind} TICKET  #${String(selected[i].number).padStart(3, "0")}`, x + cardW / 2, y + (onlyIndex === undefined ? 14 : 23), { align: "center" });
+    const qrSize = onlyIndex === undefined ? 40 : 66;
+    const qr = await QRCode.toDataURL(selected[i].token, { errorCorrectionLevel: "H", margin: 1, width: 500 });
+    pdf.addImage(qr, "PNG", x + (cardW - qrSize) / 2, y + (onlyIndex === undefined ? 17 : 31), qrSize, qrSize);
+    pdf.setFontSize(onlyIndex === undefined ? 6 : 9);
+    pdf.text("ONE ENTRY", x + cardW / 2, y + (onlyIndex === undefined ? 60 : 105), { align: "center" });
   }
-  pdf.save(`culture-day-${event.kind.toLowerCase()}-tickets.pdf`);
+  pdf.save(onlyIndex === undefined
+    ? `culture-day-${event.kind.toLowerCase()}-tickets.pdf`
+    : `culture-day-${event.kind.toLowerCase()}-ticket-${String(selected[0].number).padStart(3, "0")}.pdf`);
 }
 
 function explainError(message: string) {
@@ -46,11 +62,14 @@ export default function App() {
   const [authMode, setAuthMode] = useState<AuthMode>("signin");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [tab, setTab] = useState<"tickets" | "scanner">("tickets");
   const [events, setEvents] = useState<TicketEvent[]>([]);
+  const [ticketSets, setTicketSets] = useState<Record<string, Ticket[]>>({});
   const [selectedEvent, setSelectedEvent] = useState("");
+  const [selectedTicketNumber, setSelectedTicketNumber] = useState("1");
   const [scanResult, setScanResult] = useState<Result>(null);
   const [scanMessage, setScanMessage] = useState("");
   const [scanBusy, setScanBusy] = useState(false);
@@ -62,7 +81,7 @@ export default function App() {
 
   useEffect(() => {
     if (!supabase) return;
-    supabase.auth.getSession().then(({data}) => setSession(data.session));
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
     const { data: listener } = supabase.auth.onAuthStateChange((_event, next) => setSession(next));
     return () => listener.subscription.unsubscribe();
   }, []);
@@ -70,18 +89,19 @@ export default function App() {
   useEffect(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(STORE_KEY) || "[]") as TicketEvent[];
+      const savedTickets = JSON.parse(localStorage.getItem(TICKETS_KEY) || "{}") as Record<string, Ticket[]>;
       setEvents(saved);
+      setTicketSets(savedTickets);
       if (saved.length) setSelectedEvent(saved[0].id);
     } catch { /* ignore malformed local cache */ }
   }, []);
 
-  useEffect(() => {
-    return () => {
-      if (scannerRef.current?.isScanning) scannerRef.current.stop().catch(() => undefined);
-    };
+  useEffect(() => () => {
+    if (scannerRef.current?.isScanning) scannerRef.current.stop().catch(() => undefined);
   }, []);
 
   const currentEvent = useMemo(() => events.find(e => e.id === selectedEvent), [events, selectedEvent]);
+  const currentTickets = currentEvent ? (ticketSets[currentEvent.id] || []) : [];
 
   async function authenticate() {
     if (!supabase) return;
@@ -90,8 +110,7 @@ export default function App() {
       if (authMode === "signup") {
         const { data, error } = await supabase.auth.signUp({ email: email.trim(), password });
         if (error) throw error;
-        if (!data.session) setNotice("Account created. Check your email to confirm it, then sign in.");
-        else setNotice("Account created and signed in.");
+        setNotice(!data.session ? "Account created. Confirm your email, then sign in." : "Account created.");
       } else {
         const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
         if (error) throw error;
@@ -101,8 +120,9 @@ export default function App() {
   }
 
   async function signOut() {
+    await stopCamera();
     await supabase?.auth.signOut();
-    setScanResult(null); setCameraOn(false);
+    setScanResult(null);
   }
 
   async function createTicketSet(kind: "REAL" | "TEST", count: number) {
@@ -111,29 +131,27 @@ export default function App() {
     try {
       const response = await fetch(`${FUNCTIONS_URL}/create-event-tickets`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${session.access_token}`,
-          "apikey": import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY
-        },
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${session.access_token}`, "apikey": import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY },
         body: JSON.stringify({ name: kind === "REAL" ? "Culture Day" : "Culture Day TEST", count })
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || `Ticket creation failed (${response.status}).`);
       const event: TicketEvent = { id: payload.event_id, name: kind === "REAL" ? "Culture Day" : "Culture Day TEST", count: payload.count, kind };
-      const next = [event, ...events];
-      setEvents(next); setSelectedEvent(event.id);
-      localStorage.setItem(STORE_KEY, JSON.stringify(next));
-      await downloadTicketsPdf(event, payload.tickets);
-      setNotice(`${count} ${kind.toLowerCase()} tickets registered. The PDF has been downloaded. Keep it private.`);
+      const tickets = payload.tickets as Ticket[];
+      const nextEvents = [event, ...events];
+      const nextSets = { ...ticketSets, [event.id]: tickets };
+      setEvents(nextEvents); setTicketSets(nextSets); setSelectedEvent(event.id); setSelectedTicketNumber("1");
+      localStorage.setItem(STORE_KEY, JSON.stringify(nextEvents));
+      localStorage.setItem(TICKETS_KEY, JSON.stringify(nextSets));
+      setNotice(`${tickets.length} tickets created. Choose Download all or download them one at a time.`);
     } catch (e: any) {
-      setNotice(e.message || "Could not create tickets. No tickets were confirmed.");
+      setNotice(e.message || "Could not create tickets.");
     } finally { setEventBusy(false); }
   }
 
   async function stopCamera() {
     if (scannerRef.current?.isScanning) {
-      try { await scannerRef.current.stop(); } catch { /* camera may already be stopped */ }
+      try { await scannerRef.current.stop(); } catch { /* already stopped */ }
     }
     scannerRef.current = null;
     setCameraOn(false);
@@ -146,42 +164,35 @@ export default function App() {
     try {
       const response = await fetch(`${FUNCTIONS_URL}/verify-ticket`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${session.access_token}`,
-          "apikey": import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY
-        },
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${session.access_token}`, "apikey": import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY },
         body: JSON.stringify({ event_id: currentEvent.id, token })
       });
       if (!response.ok) {
-        if (response.status === 503) {
-          setScanResult("SERVICE_UNAVAILABLE");
-          setScanMessage("Backend unavailable. Do not admit this ticket.");
-        } else if (response.status === 401 || response.status === 403) {
-          setScanResult("INVALID");
-          setScanMessage("Scanner account is not authorized for this event.");
-        } else {
-          setScanResult("INVALID");
-          setScanMessage("Could not verify this ticket. Do not admit.");
-        }
+        setScanResult(response.status === 503 ? "SERVICE_UNAVAILABLE" : "INVALID");
+        setScanMessage(response.status === 401 || response.status === 403 ? "Scanner account is not authorized." : "Could not verify. Do not admit.");
         return;
       }
       const data = await response.json();
-      if (data.result === "VERIFIED") {
-        setScanResult("VERIFIED"); setScanMessage("First valid scan. Entry approved.");
-      } else {
-        setScanResult("INVALID"); setScanMessage("Already used, fake, revoked, or not for this event.");
-      }
+      if (data.result === "VERIFIED") { setScanResult("VERIFIED"); setScanMessage("Entry approved."); }
+      else { setScanResult("INVALID"); setScanMessage("Already used or not valid for this event."); }
     } catch {
       setScanResult("SERVICE_UNAVAILABLE");
-      setScanMessage("Connection or server error. Do not admit this ticket.");
+      setScanMessage("Could not reach the verification service. Do not admit.");
     } finally { setScanBusy(false); }
   }
 
   async function startCamera() {
-    if (!currentEvent) { setScanMessage("Create or select an event first."); return; }
+    if (!currentEvent) return;
     setScanResult(null); setScanMessage("");
     try {
+      if (Capacitor.isNativePlatform()) {
+        let permission = await Camera.checkPermissions();
+        if (permission.camera !== "granted") permission = await Camera.requestPermissions({ permissions: ["camera"] });
+        if (permission.camera !== "granted") throw new Error("Camera permission denied.");
+      }
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera access is unavailable. Allow camera access and reopen the app.");
+      const permissionStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+      permissionStream.getTracks().forEach(track => track.stop());
       const scanner = new Html5Qrcode("qr-reader");
       scannerRef.current = scanner;
       await scanner.start(
@@ -193,38 +204,35 @@ export default function App() {
           await scanner.pause(true);
           await verifyToken(decoded);
           window.setTimeout(() => { handledRef.current = false; }, 1400);
-          window.setTimeout(() => {
-            if (scannerRef.current?.isScanning) scanner.resume();
-          }, 1500);
+          window.setTimeout(() => { if (scannerRef.current?.isScanning) scanner.resume(); }, 1500);
         },
         () => undefined
       );
       setCameraOn(true);
     } catch (e: any) {
       setScanResult("SERVICE_UNAVAILABLE");
-      setScanMessage(`Camera unavailable: ${e.message || "check camera permission"}.`);
+      const msg = String(e?.message || e || "Camera permission denied.");
+      setScanMessage(/permission|denied|notallowed/i.test(msg)
+        ? "Allow Camera permission for Culture Day Tickets in Android Settings, then try again."
+        : `Camera could not start: ${msg}`);
     }
   }
 
-  if (!configured || !supabase) {
-    return <main className="shell"><section className="panel"><p className="eyebrow">CULTURE DAY / ENTRY CONTROL</p><h1>Configuration needed</h1><p>Add the Supabase URL and publishable key to your <code>.env</code> file. See README.</p></section></main>;
-  }
+  if (!configured || !supabase) return <main className="auth-shell"><section className="auth-card"><h1>Setup required</h1><p className="muted">Add the Supabase settings to the .env file.</p></section></main>;
 
   if (!session) return (
     <main className="auth-shell">
       <section className="auth-card">
-        <p className="eyebrow">CULTURE DAY / ENTRY CONTROL</p>
-        <h1>Ticket control<span>.</span></h1>
-        <p className="muted">Secure ticket issuing and one-time entry verification.</p>
+        <div className="app-mark" aria-hidden="true"><span /></div>
+        <h1>Culture Day</h1>
         <div className="auth-tabs">
-          <button className={authMode==="signin"?"active":""} onClick={()=>{setAuthMode("signin");setNotice("");}}>Sign in</button>
-          <button className={authMode==="signup"?"active":""} onClick={()=>{setAuthMode("signup");setNotice("");}}>Create account</button>
+          <button className={authMode === "signin" ? "active" : ""} onClick={() => { setAuthMode("signin"); setNotice(""); }}>Sign in</button>
+          <button className={authMode === "signup" ? "active" : ""} onClick={() => { setAuthMode("signup"); setNotice(""); }}>Create account</button>
         </div>
-        <label>Email address<input type="email" autoComplete="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com"/></label>
-        <label>Password<input type="password" autoComplete={authMode==="signin"?"current-password":"new-password"} value={password} onChange={e=>setPassword(e.target.value)} placeholder="At least 8 characters"/></label>
-        <button className="primary full" disabled={authBusy || !email || password.length<8} onClick={authenticate}>{authBusy?"Please wait…":authMode==="signin"?"Sign in":"Create account"}</button>
+        <label>Email<input type="email" autoComplete="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="Email address" /></label>
+        <label>Password<div className="password-wrap"><input type={showPassword ? "text" : "password"} autoComplete={authMode === "signin" ? "current-password" : "new-password"} value={password} onChange={e => setPassword(e.target.value)} placeholder="Password" /><button type="button" className="show-password" onClick={() => setShowPassword(v => !v)}>{showPassword ? "Hide" : "Show"}</button></div></label>
+        <button className="primary full" disabled={authBusy || !email || password.length < 8} onClick={authenticate}>{authBusy ? "Please wait…" : authMode === "signin" ? "Sign in" : "Create account"}</button>
         {notice && <p className="notice">{notice}</p>}
-        <p className="tiny">Only authorized event staff should use this app. QR codes are not consumed by ordinary camera apps.</p>
       </section>
     </main>
   );
@@ -232,49 +240,51 @@ export default function App() {
   return (
     <main className="shell">
       <header className="topbar">
-        <div><p className="eyebrow">CULTURE DAY / ENTRY CONTROL</p><div className="brand">Ticket control<span>.</span></div></div>
+        <div className="brand-lockup"><div className="app-mark small" aria-hidden="true"><span /></div><div className="brand">Culture Day</div></div>
         <div className="account"><span>{session.user.email}</span><button className="ghost" onClick={signOut}>Sign out</button></div>
       </header>
       <nav className="nav">
-        <button className={tab==="tickets"?"selected":""} onClick={()=>setTab("tickets")}>Issue tickets</button>
-        <button className={tab==="scanner"?"selected":""} onClick={()=>setTab("scanner")}>Scanner</button>
+        <button className={tab === "tickets" ? "selected" : ""} onClick={() => setTab("tickets")}>Tickets</button>
+        <button className={tab === "scanner" ? "selected" : ""} onClick={() => setTab("scanner")}>Scanner</button>
       </nav>
-
-      {tab==="tickets" ? <section className="content">
-        <div className="intro"><div><p className="eyebrow">EVENT MANAGEMENT</p><h1>Issue tickets</h1><p className="muted">Real tickets and test tickets are created as separate events.</p></div><div className="status-pill"><i/> Backend protected</div></div>
+      {tab === "tickets" ? <section className="content">
+        <h1>Tickets</h1>
         <div className="ticket-grid">
-          <article className="ticket-card">
-            <p className="eyebrow">LIVE ENTRY</p><h2>200 real tickets</h2><p className="muted">For actual Culture Day admission. Each QR is unique and can be used once.</p>
-            <button className="primary" disabled={eventBusy} onClick={()=>createTicketSet("REAL",200)}>{eventBusy?"Working…":"Generate 200 real tickets"}</button>
-          </article>
-          <article className="ticket-card test-card">
-            <p className="eyebrow">SEPARATE TEST EVENT</p><h2>25 test tickets</h2><p className="muted">For scanner testing only. They cannot redeem real Culture Day tickets.</p>
-            <button className="secondary" disabled={eventBusy} onClick={()=>createTicketSet("TEST",25)}>{eventBusy?"Working…":"Generate 25 test tickets"}</button>
-          </article>
+          <article className="ticket-card"><h2>200 tickets</h2><button className="primary" disabled={eventBusy} onClick={() => createTicketSet("REAL", 200)}>{eventBusy ? "Creating…" : "Generate tickets"}</button></article>
+          <article className="ticket-card test-card"><h2>25 test tickets</h2><button className="secondary" disabled={eventBusy} onClick={() => createTicketSet("TEST", 25)}>{eventBusy ? "Creating…" : "Generate test tickets"}</button></article>
         </div>
         {notice && <p className="notice">{notice}</p>}
-        <div className="info-strip"><strong>Important:</strong> The QR PDF is generated once when tickets are created. Save it immediately and do not share the raw QR tokens publicly.</div>
         <div className="history">
-          <div className="section-head"><div><p className="eyebrow">THIS DEVICE</p><h2>Created events</h2></div><span className="muted">{events.length} saved</span></div>
-          {events.length===0 ? <p className="empty">No event batches created on this device yet.</p> : events.map(event=><div className="event-row" key={event.id}><div><strong>{event.name}</strong><p className="tiny">{event.kind} · {event.count} tickets · {event.id}</p></div><button className="ghost" onClick={()=>{setSelectedEvent(event.id);setTab("scanner");}}>Open scanner</button></div>)}
+          <div className="section-head"><h2>Created batches</h2><span className="muted">{events.length}</span></div>
+          {!events.length ? <p className="empty">No tickets yet.</p> : events.map(event => {
+            const saved = ticketSets[event.id] || [];
+            return <div className="event-row ticket-batch" key={event.id}>
+              <div className="batch-title"><strong>{event.name}</strong><span className="tiny">{event.kind} · {event.count}</span></div>
+              <div className="batch-actions">
+                <button className="primary" disabled={!saved.length} onClick={() => downloadTicketsPdf(event, saved).catch(e => setNotice(e.message))}>Download all</button>
+                <select aria-label="Ticket number" value={event.id === selectedEvent ? selectedTicketNumber : "1"} onChange={e => { setSelectedEvent(event.id); setSelectedTicketNumber(e.target.value); }}>
+                  {Array.from({ length: saved.length }, (_, i) => <option key={i + 1} value={String(i + 1)}>#{String(i + 1).padStart(3, "0")}</option>)}
+                </select>
+                <button className="secondary" disabled={!saved.length} onClick={() => downloadTicketsPdf(event, saved, Number(event.id === selectedEvent ? selectedTicketNumber : "1") - 1).catch(e => setNotice(e.message))}>One ticket</button>
+                <button className="ghost" onClick={() => { setSelectedEvent(event.id); setTab("scanner"); }}>Scan</button>
+              </div>
+            </div>;
+          })}
         </div>
       </section> : <section className="content scanner-content">
-        <div className="intro"><div><p className="eyebrow">ADMISSION DESK</p><h1>Scan ticket</h1><p className="muted">Only this authenticated scanner can redeem a ticket.</p></div><div className="status-pill"><i/> Online session</div></div>
-        <label className="event-select">Event<select value={selectedEvent} onChange={e=>{setSelectedEvent(e.target.value);setScanResult(null);setScanMessage("");}}><option value="">Select event…</option>{events.map(e=><option key={e.id} value={e.id}>{e.name} — {e.kind}</option>)}</select></label>
+        <h1>Scanner</h1>
+        <label className="event-select">Event<select value={selectedEvent} onChange={e => { setSelectedEvent(e.target.value); setScanResult(null); setScanMessage(""); }}><option value="">Select event</option>{events.map(e => <option key={e.id} value={e.id}>{e.name} — {e.kind}</option>)}</select></label>
         <div className="scanner-layout">
-          <div className="camera-panel"><div id="qr-reader"/>{!cameraOn ? <button className="primary full" disabled={!currentEvent} onClick={startCamera}>Start camera scanner</button> : <button className="secondary full" onClick={stopCamera}>Stop camera</button>}</div>
+          <div className="camera-panel"><div id="qr-reader" />{!cameraOn ? <button className="primary full" disabled={!currentEvent} onClick={startCamera}>Start camera</button> : <button className="secondary full" onClick={stopCamera}>Stop camera</button>}</div>
           <div className="result-panel">
-            <p className="eyebrow">SCAN RESULT</p>
-            <div className={`result-display ${scanResult==="VERIFIED"?"good":scanResult==="INVALID"?"bad":scanResult==="SERVICE_UNAVAILABLE"?"offline":""}`}>
-              {scanBusy ? <div className="loading-dot"/> : scanResult==="VERIFIED" ? <><div className="checkmark">✓</div><div className="result-word">VERIFIED</div></> : scanResult==="INVALID" ? <><div className="cross">×</div><div className="result-word">INVALID</div></> : scanResult==="SERVICE_UNAVAILABLE" ? <><div className="cross">!</div><div className="result-word">OFFLINE</div></> : <><div className="scan-icon">⌗</div><div className="result-word idle">READY</div></>}
+            <div className={`result-display ${scanResult === "VERIFIED" ? "good" : scanResult === "INVALID" ? "bad" : scanResult === "SERVICE_UNAVAILABLE" ? "offline" : ""}`}>
+              {scanBusy ? <div className="loading-dot" /> : scanResult === "VERIFIED" ? <><div className="checkmark">✓</div><div className="result-word">VERIFIED</div></> : scanResult === "INVALID" ? <><div className="cross">×</div><div className="result-word">INVALID</div></> : scanResult === "SERVICE_UNAVAILABLE" ? <><div className="cross">!</div><div className="result-word">OFFLINE</div></> : <><div className="scan-icon">⌗</div><div className="result-word idle">READY</div></>}
             </div>
-            <p className="result-message">{scanBusy?"Checking ticket securely…":scanMessage || "Scan a QR code to check admission."}</p>
-            <div className="manual"><label>Manual token entry<input value={manualToken} onChange={e=>setManualToken(e.target.value)} placeholder="Paste QR token"/></label><button className="secondary full" disabled={!manualToken.trim() || !currentEvent || scanBusy} onClick={()=>verifyToken(manualToken)}>Verify token</button></div>
-            <p className="tiny">If the backend is unavailable, the scanner fails closed. Never admit on an OFFLINE result.</p>
+            <p className="result-message">{scanBusy ? "Checking…" : scanMessage}</p>
+            <div className="manual"><label>Enter code<input value={manualToken} onChange={e => setManualToken(e.target.value)} placeholder="Ticket code" /></label><button className="secondary full" disabled={!manualToken.trim() || !currentEvent || scanBusy} onClick={() => verifyToken(manualToken)}>Verify</button></div>
           </div>
         </div>
       </section>}
-      <footer>Culture Day · Secure entry system</footer>
     </main>
   );
 }

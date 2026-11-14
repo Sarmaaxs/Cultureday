@@ -1,0 +1,8 @@
+
+node_modules/
+dist/
+android/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
